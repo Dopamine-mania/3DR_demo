@@ -1,0 +1,23 @@
+# Data / large artifacts (do not push)
+main/data/
+main/processed/
+main/output/
+
+# Customer docs (keep local unless explicitly allowed)
+客户需求/
+
+# Notebooks / temp
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+
