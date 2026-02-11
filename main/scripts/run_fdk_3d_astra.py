@@ -10,6 +10,7 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from ct3dr.astra_fdk import ConeVecGeom, run_fdk_cuda, u16_to_line_integral
+from ct3dr.view_sampling import select_views
 
 
 def save_png(img: np.ndarray, out_png: Path) -> None:
@@ -38,6 +39,10 @@ def main() -> int:
     ap.add_argument("--ny", type=int, default=192)
     ap.add_argument("--nz", type=int, default=192)
     ap.add_argument("--i0", type=float, default=None, help="Intensity I0 for -log(I/I0); default=auto")
+    ap.add_argument("--view_mode", choices=["full", "sparse", "limited"], default="full")
+    ap.add_argument("--sparse_keep", type=int, default=90)
+    ap.add_argument("--limited_center_deg", type=float, default=180.0)
+    ap.add_argument("--limited_span_deg", type=float, default=120.0)
     args = ap.parse_args()
 
     processed_dir: Path = args.processed_dir
@@ -64,7 +69,19 @@ def main() -> int:
     ds = int(proj_meta["downsample"])
     det_rows = int(proj_meta["output_shape"][1])
     det_cols = int(proj_meta["output_shape"][2])
-    num_projections = int(proj_meta["num_projections"])
+    num_projections_full = int(proj_meta["num_projections"])
+
+    sel = select_views(
+        num_projections_full,
+        start_angle_deg=float(scan["start_angle_deg"]),
+        rotation_ccw=bool(scan["rotation_ccw"]),
+        mode=str(args.view_mode),
+        sparse_keep=int(args.sparse_keep),
+        limited_center_deg=float(args.limited_center_deg),
+        limited_span_deg=float(args.limited_span_deg),
+    )
+    view_idx = sel.indices
+    angles_rad = sel.angles_rad
 
     # Effective center offsets in the cropped detector coordinates.
     full_cols = int(scan["detector_cols"])
@@ -91,17 +108,19 @@ def main() -> int:
         det_center_offset_y_px=float(det_offset_y_px),
         rotation_ccw=bool(scan["rotation_ccw"]),
         start_angle_deg=float(scan["start_angle_deg"]),
-        num_projections=num_projections,
+        num_projections=int(view_idx.size),
+        angles_rad_override=angles_rad,
     )
 
     # Load uint16 projections and convert to line integrals.
     proj_u16 = np.load(proj_path, mmap_mode="r")  # (V,H,W)
-    if proj_u16.shape != (num_projections, det_rows, det_cols):
+    if proj_u16.shape != (num_projections_full, det_rows, det_cols):
         raise ValueError(f"projections.npy shape mismatch: {proj_u16.shape}")
+    proj_u16 = proj_u16[view_idx, :, :]
 
     # Estimate I0 from a subset for speed.
     if args.i0 is None:
-        sample = np.asarray(proj_u16[:: max(1, num_projections // 30), :, :], dtype=np.float32)
+        sample = np.asarray(proj_u16[:: max(1, proj_u16.shape[0] // 30), :, :], dtype=np.float32)
         i0 = float(np.quantile(sample, 0.999))
     else:
         i0 = float(args.i0)
@@ -125,7 +144,12 @@ def main() -> int:
     report = {
         "processed_dir": str(processed_dir),
         "i0": i0,
-        "vec_geom": vec_geom.__dict__,
+        "view_mode": str(args.view_mode),
+        "view_count": int(view_idx.size),
+        "vec_geom": {
+            **{k: v for k, v in vec_geom.__dict__.items() if k != "angles_rad_override"},
+            "angles_rad_override": None if angles_rad is None else angles_rad.astype(float).tolist(),
+        },
         "astra_report": rep,
         "out_slices": ["slice_zc.png", "slice_yc.png", "slice_xc.png"],
     }
@@ -136,4 +160,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

@@ -20,14 +20,20 @@ class ConeVecGeom:
     rotation_ccw: bool = True
     start_angle_deg: float = 0.0
     num_projections: int = 0
+    angles_rad_override: np.ndarray | None = None
 
     @property
     def dod_mm(self) -> float:
         return float(self.dsd_mm) - float(self.dso_mm)
 
     def angles_rad(self) -> np.ndarray:
+        if self.angles_rad_override is not None:
+            ang = np.asarray(self.angles_rad_override, dtype=np.float32)
+            if ang.ndim != 1 or ang.size == 0:
+                raise ValueError("angles_rad_override must be a non-empty 1D array")
+            return ang
         if self.num_projections <= 0:
-            raise ValueError("num_projections must be > 0")
+            raise ValueError("num_projections must be > 0 when angles_rad_override is None")
         start = math.radians(float(self.start_angle_deg))
         step = 2.0 * math.pi / float(self.num_projections)
         idx = np.arange(self.num_projections, dtype=np.float32)
@@ -147,4 +153,3 @@ def run_fdk_cuda(
         "num_projections": V,
     }
     return vol, report
-
