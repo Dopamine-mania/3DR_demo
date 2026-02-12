@@ -26,7 +26,18 @@ def metrics_pair(a_path: Path, b_path: Path, dice_thr: float = 0.5) -> dict[str,
     a = np.load(a_path, mmap_mode="r")
     b = np.load(b_path, mmap_mode="r")
     if a.shape != b.shape:
-        raise ValueError(f"Shape mismatch: {a_path} {a.shape} vs {b_path} {b.shape}")
+        # Center-crop both to the common minimum shape.
+        target = tuple(int(min(sa, sb)) for sa, sb in zip(a.shape, b.shape))
+
+        def crop_center(x: np.ndarray, shape):
+            slices = []
+            for dim, t in zip(x.shape, shape):
+                start = max(0, (dim - t) // 2)
+                slices.append(slice(start, start + t))
+            return np.asarray(x[tuple(slices)])
+
+        a = crop_center(a, target)
+        b = crop_center(b, target)
     a_n = norm01(np.asarray(a))
     b_n = norm01(np.asarray(b))
     res = compute_all(a_n, b_n, data_range=1.0, dice_threshold=float(dice_thr))
@@ -69,4 +80,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
