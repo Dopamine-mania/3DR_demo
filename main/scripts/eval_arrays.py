@@ -30,6 +30,12 @@ def main() -> int:
     ap.add_argument("--raw_shape", type=str, default=None, help="For .raw: e.g. 3820,813,813 or 813,813")
     ap.add_argument("--data_range", type=float, default=1.0)
     ap.add_argument("--dice_thr", type=float, default=None)
+    ap.add_argument(
+        "--normalize",
+        choices=["none", "p1p99"],
+        default="none",
+        help="Optional normalization before metrics: p1p99 maps percentiles [1,99] -> [0,1].",
+    )
     ap.add_argument("--out_json", type=Path, default=None)
     args = ap.parse_args()
 
@@ -39,6 +45,17 @@ def main() -> int:
 
     a = load_array(args.a, raw_shape)
     b = load_array(args.b, raw_shape)
+
+    if args.normalize == "p1p99":
+        def norm01(x):
+            x = x.astype(np.float32)
+            lo, hi = np.percentile(x, [1.0, 99.0])
+            if hi <= lo:
+                hi = lo + 1.0
+            return np.clip((x - lo) / (hi - lo), 0.0, 1.0).astype(np.float32)
+
+        a = norm01(a)
+        b = norm01(b)
 
     res = compute_all(a, b, data_range=float(args.data_range), dice_threshold=args.dice_thr)
     d = res.to_dict()

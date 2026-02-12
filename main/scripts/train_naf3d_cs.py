@@ -11,7 +11,8 @@ sys.path.append(str(Path(__file__).resolve().parents[1]))
 import numpy as np
 
 from ct3dr.astra_fdk import u16_to_line_integral
-from ct3dr.naf3d import TrainNAF3DConfig, render_volume, train_naf3d
+from ct3dr.naf3d import MLP3D, PosEnc3D, build_cone_beam_rays, forward_project_grid, render_volume, tv_loss_grad
+from ct3dr.torch_losses import dice_loss, ssim_loss
 from ct3dr.view_sampling import select_views
 
 
@@ -41,8 +42,8 @@ def main() -> int:
     ap.add_argument("--n_samples", type=int, default=64)
     ap.add_argument("--steps", type=int, default=2000)
     ap.add_argument("--lr", type=float, default=2e-3)
-    ap.add_argument("--batch_views", type=int, default=2)
-    ap.add_argument("--batch_pixels", type=int, default=2048)
+    ap.add_argument("--batch_views", type=int, default=1)
+    ap.add_argument("--patch", type=int, default=96, help="Detector patch size for composite loss (square)")
     ap.add_argument("--tv_weight", type=float, default=1e-4)
     ap.add_argument("--tv_points", type=int, default=2048)
     ap.add_argument("--hot_q", type=float, default=0.98, help="Quantile for hot-pixel sampling")
@@ -53,6 +54,10 @@ def main() -> int:
         default="residual",
         help="raw: use -log(I/I0); residual: subtract per-view median and clamp >=0 (focus particles)",
     )
+
+    ap.add_argument("--posenc_freqs", type=int, default=6)
+    ap.add_argument("--mlp_width", type=int, default=128)
+    ap.add_argument("--mlp_depth", type=int, default=6)
 
     ap.add_argument("--render_n", type=int, default=160, help="Render volume size (cube)")
     ap.add_argument("--render_chunk", type=int, default=131072)
@@ -116,39 +121,153 @@ def main() -> int:
         proj_line = proj_line - med[:, None, None]
         proj_line = np.clip(proj_line, 0.0, None)
 
-    half = float(args.half_mm)
-    cfg = TrainNAF3DConfig(
-        half_size_mm=(half, half, half),
-        n_samples=int(args.n_samples),
-        lr=float(args.lr),
-        steps=int(args.steps),
-        batch_views=int(args.batch_views),
-        batch_pixels=int(args.batch_pixels),
-        tv_weight=float(args.tv_weight),
-        tv_points=int(args.tv_points),
-        hot_quantile=float(args.hot_q),
-        hot_fraction=float(args.hot_frac),
-        device=str(args.device),
-    )
+    # Build "hot" coordinates per view for patch sampling.
+    V, H, W = proj_line.shape
+    hot_thr = float(np.quantile(proj_line.reshape(V, -1), float(args.hot_q)))
+    hot_coords: list[np.ndarray] = []
+    for v in range(V):
+        coords = np.argwhere(proj_line[v] > hot_thr)  # (N,2) row,col
+        hot_coords.append(coords.astype(np.int64, copy=False))
 
-    t0 = time.time()
-    summary, mlp, pe, _ = train_naf3d(
-        proj_line,
+    import torch
+
+    torch.manual_seed(int(args.seed))
+    dev = torch.device(args.device if (args.device == "cpu" or torch.cuda.is_available()) else "cpu")
+
+    rays = build_cone_beam_rays(
         sel.angles_rad,
         dso_mm=float(scan["dso_mm"]),
         dsd_mm=float(scan["dsd_mm"]),
+        det_rows=int(det_rows),
+        det_cols=int(det_cols),
         det_spacing_x_mm=float(det_spacing_x),
         det_spacing_y_mm=float(det_spacing_y),
         det_center_offset_x_px=float(det_offset_x_px),
         det_center_offset_y_px=float(det_offset_y_px),
-        cfg=cfg,
-        seed=int(args.seed),
+        device=dev,
     )
-    summary["elapsed_sec"] = float(time.time() - t0)
-    summary["i0"] = float(i0)
-    summary["view_mode"] = str(args.view_mode)
-    summary["view_count"] = int(sel.indices.size)
-    summary["target_mode"] = str(args.target_mode)
+
+    pe = PosEnc3D(int(args.posenc_freqs)).to(dev)
+    in_dim = 3 + 6 * int(args.posenc_freqs)
+    mlp = MLP3D(in_dim=in_dim, width=int(args.mlp_width), depth=int(args.mlp_depth)).to(dev)
+    opt = torch.optim.Adam(mlp.parameters(), lr=float(args.lr))
+
+    proj_t = torch.as_tensor(proj_line, device=dev, dtype=torch.float32)  # (V,H,W)
+
+    patch = int(args.patch)
+    if patch <= 8 or patch > min(H, W):
+        raise ValueError(f"--patch must be in [9, {min(H,W)}], got {patch}")
+
+    half = float(args.half_mm)
+    half_box = (half, half, half)
+
+    log: list[dict[str, float]] = []
+    t0 = time.time()
+    for step in range(int(args.steps)):
+        view_ids = torch.randint(0, V, (int(args.batch_views),), device=dev)
+
+        total = torch.tensor(0.0, device=dev)
+        mse_v = torch.tensor(0.0, device=dev)
+        l1_v = torch.tensor(0.0, device=dev)
+        ssim_v = torch.tensor(0.0, device=dev)
+        dice_v = torch.tensor(0.0, device=dev)
+
+        for vv in view_ids.tolist():
+            hc = hot_coords[int(vv)]
+            if hc.size > 0:
+                rr, cc = hc[np.random.randint(0, hc.shape[0])]
+            else:
+                rr = np.random.randint(0, H)
+                cc = np.random.randint(0, W)
+            r0 = int(np.clip(rr - patch // 2, 0, H - patch))
+            c0 = int(np.clip(cc - patch // 2, 0, W - patch))
+
+            row_ids = torch.arange(r0, r0 + patch, device=dev, dtype=torch.int64)
+            col_ids = torch.arange(c0, c0 + patch, device=dev, dtype=torch.int64)
+
+            pred = forward_project_grid(
+                mlp,
+                pe,
+                rays,
+                view_ids=torch.tensor([vv], device=dev, dtype=torch.int64),
+                row_ids=row_ids,
+                col_ids=col_ids,
+                half_size_mm=half_box,
+                n_samples=int(args.n_samples),
+                normalize_coords=True,
+            )[0]  # (patch,patch)
+            tgt = proj_t[vv, r0 : r0 + patch, c0 : c0 + patch]
+
+            # Normalize to [0,1] for composite loss stability.
+            scale = torch.quantile(tgt.flatten(), 0.99).clamp(min=1e-6)
+            pred_n = (pred / scale).clamp(0.0, 1.0)
+            tgt_n = (tgt / scale).clamp(0.0, 1.0)
+
+            diff = pred_n - tgt_n
+            mse = torch.mean(diff * diff)
+            l1 = torch.mean(torch.abs(diff))
+            ssim_l = ssim_loss(pred_n[None, None, :, :], tgt_n[None, None, :, :], data_range=1.0)
+            dice_l = dice_loss(pred_n[None, None, :, :], tgt_n[None, None, :, :])
+            loss = mse + l1 + ssim_l + dice_l
+
+            mse_v = mse_v + mse
+            l1_v = l1_v + l1
+            ssim_v = ssim_v + ssim_l
+            dice_v = dice_v + dice_l
+            total = total + loss
+
+        # Average over views.
+        bv = max(1, int(args.batch_views))
+        total = total / float(bv)
+        mse_v = mse_v / float(bv)
+        l1_v = l1_v / float(bv)
+        ssim_v = ssim_v / float(bv)
+        dice_v = dice_v / float(bv)
+
+        tv = torch.tensor(0.0, device=dev)
+        if float(args.tv_weight) > 0:
+            pts = (torch.rand(int(args.tv_points), 3, device=dev) * 2.0 - 1.0) * torch.tensor(
+                list(half_box), device=dev, dtype=torch.float32
+            )
+            tv = tv_loss_grad(mlp, pe, pts, half_size_mm=half_box)
+            total = total + float(args.tv_weight) * tv
+
+        opt.zero_grad(set_to_none=True)
+        total.backward()
+        opt.step()
+
+        if step % 50 == 0 or step == int(args.steps) - 1:
+            log.append(
+                {
+                    "step": float(step),
+                    "mse": float(mse_v.item()),
+                    "l1": float(l1_v.item()),
+                    "ssim_loss": float(ssim_v.item()),
+                    "dice_loss": float(dice_v.item()),
+                    "tv": float(tv.item()),
+                    "total": float(total.item()),
+                }
+            )
+
+    summary = {
+        "elapsed_sec": float(time.time() - t0),
+        "i0": float(i0),
+        "view_mode": str(args.view_mode),
+        "view_count": int(sel.indices.size),
+        "target_mode": str(args.target_mode),
+        "half_mm": float(args.half_mm),
+        "n_samples": int(args.n_samples),
+        "steps": int(args.steps),
+        "lr": float(args.lr),
+        "batch_views": int(args.batch_views),
+        "patch": int(args.patch),
+        "tv_weight": float(args.tv_weight),
+        "tv_points": int(args.tv_points),
+        "posenc_freqs": int(args.posenc_freqs),
+        "mlp_width": int(args.mlp_width),
+        "mlp_depth": int(args.mlp_depth),
+        "loss_log": log,
+    }
     (out_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # Render a cubic volume for visualization.

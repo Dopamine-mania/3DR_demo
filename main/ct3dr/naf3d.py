@@ -24,20 +24,72 @@ class PosEnc3D(nn.Module):
         return torch.cat(outs, dim=-1)
 
 
+class SimpleGate(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        a, b = x.chunk(2, dim=-1)
+        return a * b
+
+
+class Asymmetric_Attention_Block(nn.Module):
+    """
+    NAF-like non-symmetric attention block for MLP features.
+
+    - SimpleGate replaces the standard activation.
+    - Channel Attention: per-sample channel reweighting.
+    - Peak Attention: extra reweighting driven by per-sample peak response.
+    """
+
+    def __init__(self, channels: int, attn_hidden: int | None = None):
+        super().__init__()
+        c = int(channels)
+        if c <= 0:
+            raise ValueError("channels must be > 0")
+        self.norm = nn.LayerNorm(c)
+        self.fc_in = nn.Linear(c, 2 * c)
+        self.gate = SimpleGate()
+
+        h = int(attn_hidden) if attn_hidden is not None else max(8, c // 4)
+        self.ca_fc1 = nn.Linear(c, h)
+        self.ca_fc2 = nn.Linear(h, c)
+
+        self.pa_fc = nn.Linear(1, c)
+
+        self.fc_out = nn.Linear(c, c)
+        self.beta = nn.Parameter(torch.zeros((1, c)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        y = self.norm(x)
+        y = self.fc_in(y)
+        y = self.gate(y)
+
+        # Channel Attention (self-conditioned).
+        ca = torch.sigmoid(self.ca_fc2(torch.relu(self.ca_fc1(y))))
+
+        # Peak Attention (asymmetric): driven by maximum channel magnitude.
+        peak = torch.amax(torch.abs(y), dim=-1, keepdim=True)
+        pa = torch.sigmoid(self.pa_fc(peak))
+
+        y = y * ca * pa
+        y = self.fc_out(y)
+        return x + y * self.beta
+
+
 class MLP3D(nn.Module):
     def __init__(self, in_dim: int, width: int = 128, depth: int = 6):
         super().__init__()
-        layers: list[nn.Module] = []
-        d = in_dim
-        for _ in range(int(depth)):
-            layers.append(nn.Linear(d, int(width)))
-            layers.append(nn.ReLU(inplace=True))
-            d = int(width)
-        layers.append(nn.Linear(d, 1))
-        self.net = nn.Sequential(*layers)
+        w = int(width)
+        d = int(depth)
+        self.fc0 = nn.Linear(int(in_dim), w)
+        self.blocks = nn.ModuleList([Asymmetric_Attention_Block(w) for _ in range(d)])
+        self.norm = nn.LayerNorm(w)
+        self.fc1 = nn.Linear(w, 1)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        y = self.fc0(x)
+        for blk in self.blocks:
+            y = blk(y)
+        y = self.norm(y)
+        return self.fc1(y)
 
 
 @dataclass(frozen=True)

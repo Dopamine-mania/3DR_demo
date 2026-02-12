@@ -48,3 +48,27 @@ python3 main/scripts/particle_stats.py main/output/fdk_3d/vol.npy --voxel_mm 0.2
 python3 main/scripts/train_naf2d.py --steps 800 --device cuda --out_dir main/output/naf2d
 ```
 
+## Stage 2/3: 3D NAF + CS(TV)（论文级版本）
+
+### 1) 3D NAF-Attention + 复合 Loss 训练（支持 sparse / limited）
+```
+python3 main/scripts/train_naf3d_cs.py --processed_dir main/processed/6_ds4 --out_dir main/output/stage3_nafattn_limited120 --view_mode limited --limited_span_deg 120 --steps 2500 --patch 96 --n_samples 64 --tv_weight 1e-3 --half_mm 45 --device cuda
+```
+说明：
+- 模型中包含 `Asymmetric_Attention_Block`（SimpleGate + Channel/Peak Attention）。
+- Loss：`MSE + L1 + SSIM_Loss + Dice_Loss (+ TV)`，训练目标默认用 `residual`（聚焦微粒）。
+
+### 2) 3D FDK（有限角）对比
+```
+python3 main/scripts/run_fdk_3d_astra.py --processed_dir main/processed/6_ds4 --out_dir main/output/stage3_fdk_limited120 --view_mode limited --limited_span_deg 120 --nx 160 --ny 160 --nz 160 --voxel_mm 0.25
+```
+
+### 3) Stage3 战报图（正交 MIP）
+```
+python3 main/scripts/make_stage3_limited120_battle.py --out_png main/output/stage3_limited120_battle.png
+```
+
+### 4) Metrics 汇总表（XLSX）
+```
+python3 main/scripts/make_metrics_table_xlsx.py --out_xlsx main/output/metrics_summary.xlsx
+```

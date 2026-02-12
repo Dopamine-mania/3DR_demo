@@ -30,6 +30,23 @@ def mip_xy(vol: np.ndarray, crop: int = 140) -> np.ndarray:
     return img
 
 
+def mip_ortho(vol: np.ndarray, crop: int = 140) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    v = np.clip(vol, 0, None).astype(np.float32)
+    xy = np.max(v, axis=0)  # (Y,X)
+    xz = np.max(v, axis=1)  # (Z,X)
+    yz = np.max(v, axis=2)  # (Z,Y)
+
+    def crop_center(img: np.ndarray) -> np.ndarray:
+        h, w = img.shape
+        cy, cx = h // 2, w // 2
+        r = crop // 2
+        y0, y1 = max(0, cy - r), min(h, cy + r)
+        x0, x1 = max(0, cx - r), min(w, cx + r)
+        return img[y0:y1, x0:x1]
+
+    return crop_center(xy), crop_center(xz), crop_center(yz)
+
+
 def best_slice_z(vol: np.ndarray, crop: int = 140) -> tuple[int, np.ndarray]:
     nz, ny, nx = vol.shape
     cy, cx = ny // 2, nx // 2
@@ -69,7 +86,7 @@ def main() -> int:
     ap.add_argument("--nafcs_sparse", type=Path, default=Path("main/output/stage2_nafcs_sparse90/vol.npy"))
     ap.add_argument("--out_png", type=Path, default=Path("main/output/stage2_battle.png"))
     ap.add_argument("--crop", type=int, default=140)
-    ap.add_argument("--mode", choices=["slice", "mip"], default="mip")
+    ap.add_argument("--mode", choices=["slice", "mip", "mip_ortho"], default="mip")
     args = ap.parse_args()
 
     vols = [
@@ -82,13 +99,31 @@ def main() -> int:
     for title, v in vols:
         if args.mode == "mip":
             img = mip_xy(v, crop=int(args.crop))
+            u8 = _to_uint8(img, p_lo=1.0, p_hi=99.9, gamma=0.7)
+            im = Image.fromarray(u8)
+            im = _label(im, title)
+            imgs.append(im)
+        elif args.mode == "mip_ortho":
+            xy, xz, yz = mip_ortho(v, crop=int(args.crop))
+            tiles = []
+            for sub in (xy, xz, yz):
+                u8 = _to_uint8(sub, p_lo=1.0, p_hi=99.9, gamma=0.7)
+                tiles.append(Image.fromarray(u8))
+            w = max(t.size[0] for t in tiles)
+            h = max(t.size[1] for t in tiles)
+            tiles = [t.resize((w, h), resample=Image.BILINEAR) for t in tiles]
+            panel = Image.new("L", (w, h * 3), 0)
+            for i, t in enumerate(tiles):
+                panel.paste(t, (0, i * h))
+            panel = _label(panel, title)
+            imgs.append(panel)
         else:
             z, img = best_slice_z(v, crop=int(args.crop))
             title = f"{title} (z={z})"
-        u8 = _to_uint8(img, p_lo=1.0, p_hi=99.9, gamma=0.7)
-        im = Image.fromarray(u8)
-        im = _label(im, title)
-        imgs.append(im)
+            u8 = _to_uint8(img, p_lo=1.0, p_hi=99.9, gamma=0.7)
+            im = Image.fromarray(u8)
+            im = _label(im, title)
+            imgs.append(im)
 
     w, h = imgs[0].size
     out = Image.new("RGB", (w * 3, h), (0, 0, 0))
@@ -102,4 +137,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-
